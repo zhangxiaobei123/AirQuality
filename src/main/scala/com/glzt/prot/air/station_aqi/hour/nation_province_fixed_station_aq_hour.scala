@@ -1,0 +1,122 @@
+package com.glzt.prot.air.station_aqi.hour
+
+import com.glzt.prot.utils.AQI.get_grade
+import com.glzt.prot.utils.Grid.get_station_grid
+import com.glzt.prot.utils.StationHour.do_storage
+import org.apache.spark.sql.{SaveMode, SparkSession}
+import org.apache.spark.sql.functions.{broadcast, col, date_format, from_unixtime, lit, lower, regexp_replace, split, struct, to_json, when}
+import org.apache.spark.sql.types.{DoubleType, IntegerType}
+
+import java.text.SimpleDateFormat
+import java.util.{Calendar, Date, Properties}
+
+object nation_province_fixed_station_aq_hour {
+  def main(args: Array[String]): Unit = {
+    val spark = SparkSession
+      .builder()
+      .appName("国控省控站点小时空气质量监测数据的小时aqi计算")
+      .config("hive.exec.dynamic.partition.mode", "nonstrict")
+      .config("hive.exec.dynamic.partition", "true")
+      .config("spark.debug.maxToStringFields", "100")
+      .config("spark.sql.jsonGenerator.ignoreNullFields", "false")
+      .config("spark.sql.crossJoin.enabled", "true")
+      .enableHiveSupport()
+      .getOrCreate()
+
+    val Array(start_hour) = args
+    val df = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss")
+    val start_date = df.parse(start_hour)
+    val cal = Calendar.getInstance
+    cal.setTime(start_date)
+    cal.add(Calendar.HOUR, 2)
+    val end_hour = df.format(new Date(cal.getTimeInMillis))
+
+    val props = new Properties()
+    props.put("user", "glzt-pro-bigdata")
+    props.put("password", "Uhh4QxUwiMsQ4mK4")
+    val url = "jdbc:mysql://192.168.108.37:3306/alpha-center?useUnicode=true&characterEncoding=UTF-8&zeroDateTimeBehavior=convertToNull"
+
+    val sqlserver_url = "jdbc:sqlserver://171.221.172.168:14331;database=airAQI_zxz"
+    val tb_name = s"(select StationCode,TimePoint,SO2,NO2,PM10,CO,O3,PM25,ISO2,INO2,IPM10,ICO,IO3,IPM25,AQI,PrimaryPollutant,Level,UpdateTime from MS_HOUR_DATA where UpdateTime>='$start_hour' and UpdateTime<'$end_hour') as MS_HOUR_DATA_filtered"
+    //缺失国省控站点aq处理
+    val source_station_data = spark.read.format("jdbc")
+      .option("url", sqlserver_url)
+      .option("databaseName", "airAQI_zxz")
+      .option("driver", "com.microsoft.sqlserver.jdbc.SQLServerDriver")
+      .option("dbtable", tb_name)
+      .option("user", "sa")
+      .option("password", "DataCenter1").load()
+      .withColumn("UpdateTime",col("UpdateTime").cast(IntegerType))
+      .withColumn("TimePoint",col("TimePoint").cast(IntegerType))
+      .withColumn("UpdateTime", from_unixtime(col("UpdateTime"), "yyyy-MM-dd HH:mm:ss"))
+      .withColumn("TimePoint", from_unixtime(col("TimePoint"), "yyyy-MM-dd HH:mm:ss"))
+
+    source_station_data.withColumn("publish_date",date_format(col("TimePoint"),"yyyy-MM-dd"))
+      .coalesce(1).write.option("fileFormat","parquet").format("hive").mode(SaveMode.Append)
+      .insertInto("ods_air.ods_nation_province_fixed_station_aq")
+
+    val station_grid = get_station_grid(spark, url, props)
+    val station_map = spark.read.jdbc(url, "station_map", props).select("station_code", "code_map")
+    val cleand_station_data = source_station_data
+      .withColumnRenamed("TimePoint", "published_at")
+      .withColumnRenamed("SO2", "so2")
+      .withColumnRenamed("NO2", "no2")
+      .withColumnRenamed("PM10", "pm10")
+      .withColumnRenamed("CO", "co")
+      .withColumnRenamed("O3", "o3")
+      .withColumnRenamed("PM25", "pm2_5")
+      .withColumnRenamed("AQI", "aqi")
+      .withColumnRenamed("ISO2", "so2_iaqi")
+      .withColumnRenamed("INO2", "no2_iaqi")
+      .withColumnRenamed("IPM10", "pm10_iaqi")
+      .withColumnRenamed("ICO", "co_iaqi")
+      .withColumnRenamed("IO3", "o3_iaqi")
+      .withColumnRenamed("IPM25", "pm2_5_iaqi")
+      .withColumnRenamed("PrimaryPollutant", "primary_pollutants")
+      .withColumnRenamed("Level", "grade")
+      .filter(col("so2").isNotNull || col("no2").isNotNull || col("pm10").isNotNull || col("co").isNotNull || col("o3").isNotNull || col("pm2_5").isNotNull)
+      .filter(col("so2").=!=("—") || col("no2").=!=("—") || col("pm10").=!=("—") || col("co").=!=("—") || col("o3").=!=("—") || col("pm2_5").=!=("—"))
+      .join(broadcast(station_map), station_map.col("code_map").===(col("StationCode")))
+      .withColumn("published_at", date_format(col("published_at"), "yyyy-MM-dd HH:00:00"))
+      .dropDuplicates("station_code", "published_at")
+      .withColumn("so2", when(col("so2").===("-"), null).otherwise(lit(col("so2"))))
+      .withColumn("pm2_5", when(col("pm2_5").===("-"), null).otherwise(lit(col("pm2_5"))))
+      .withColumn("pm10", when(col("pm10").===("-"), null).otherwise(lit(col("pm10"))))
+      .withColumn("so2", when(col("so2").===("-"), null).otherwise(lit(col("so2"))))
+      .withColumn("no2", when(col("no2").===("-"), null).otherwise(lit(col("no2"))))
+      .withColumn("co", when(col("co").===("-"), null).otherwise(lit(col("co"))))
+      .withColumn("o3", when(col("o3").===("-"), null).otherwise(lit(col("o3"))))
+      .withColumn("so2_iaqi", when(col("so2_iaqi").===("—"), null).otherwise(lit(col("so2_iaqi"))))
+      .withColumn("no2_iaqi", when(col("no2_iaqi").===("—"), null).otherwise(lit(col("no2_iaqi"))))
+      .withColumn("pm10_iaqi", when(col("pm10_iaqi").===("—"), null).otherwise(lit(col("pm10_iaqi"))))
+      .withColumn("co_iaqi", when(col("co_iaqi").===("—"), null).otherwise(lit(col("co_iaqi"))))
+      .withColumn("o3_iaqi", when(col("o3_iaqi").===("—"), null).otherwise(lit(col("o3_iaqi"))))
+      .withColumn("pm2_5_iaqi", when(col("pm2_5_iaqi").===("—"), null).otherwise(lit(col("pm2_5_iaqi"))))
+      .withColumn("aqi",when(col("aqi").rlike("\\d+"),lit(col("aqi"))).otherwise(null))
+      .withColumn("co", col("co").cast(DoubleType))
+      .withColumn("o3", col("o3").cast(IntegerType))
+      .withColumn("no2", col("no2").cast(IntegerType))
+      .withColumn("so2", col("so2").cast(IntegerType))
+      .withColumn("pm10", col("pm10").cast(IntegerType))
+      .withColumn("pm2_5", col("pm2_5").cast(IntegerType))
+      .withColumn("aqi", col("aqi").cast(IntegerType))
+      .withColumn("so2_iaqi", col("so2_iaqi").cast(IntegerType))
+      .withColumn("no2_iaqi", col("no2_iaqi").cast(IntegerType))
+      .withColumn("pm10_iaqi", col("pm10_iaqi").cast(IntegerType))
+      .withColumn("co_iaqi", col("co_iaqi").cast(IntegerType))
+      .withColumn("o3_iaqi", col("o3_iaqi").cast(IntegerType))
+      .withColumn("pm2_5_iaqi", col("pm2_5_iaqi").cast(IntegerType))
+      .withColumn("grade", when(col("grade").isNull,null).otherwise(lit(get_grade(col("aqi")))))
+      .withColumn("primary_pollutants",lower(col("primary_pollutants")))
+      .withColumn("primary_pollutants", when(col("primary_pollutants").rlike("[a-z]"),when(col("primary_pollutants").contains("pm2.5") || col("primary_pollutants").contains("pm25"),
+          split(regexp_replace(col("primary_pollutants"),"pm2.5|pm25","pm2_5"),","))
+          .otherwise(lit(split(col("primary_pollutants"),",")))).otherwise(null))
+      .join(broadcast(station_grid), station_grid.col("source_station_code").===(col("station_code"))).drop("source_station_code")
+      .filter(col("so2").isNotNull || col("no2").isNotNull || col("pm10").isNotNull || col("co").isNotNull || col("o3").isNotNull || col("pm2_5").isNotNull)
+      .withColumn("publish_date", lit(col("published_at").substr(0, 10)))
+      .withColumn("data", to_json(struct(col("aqi"), col("no2_iaqi"), col("so2_iaqi"), col("co_iaqi"), col("o3_iaqi"), col("pm2_5_iaqi"), col("pm10_iaqi"), col("grade"), col("primary_pollutants"), col("no2"), col("so2"), col("co"), col("o3"), col("pm2_5"), col("pm10")), Map("ignoreNullFields" -> "true")))
+
+    do_storage(cleand_station_data)
+    spark.stop()
+  }
+}
